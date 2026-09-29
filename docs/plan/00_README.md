@@ -1,3 +1,7 @@
+> **Superseded 2026-09-29 (ADR-0005):** this Databricks milestone plan is no longer the active roadmap.
+> The active track is `prototype/` — a local PyTorch model and Plotly Dash dashboard on synthetic data.
+> Kept here as reference for the domain research and for a later real-data integration.
+
 # FrostSight: technical implementation plan
 
 Audience: a senior engineer with Python, SQL and cloud experience but no Databricks experience. Every

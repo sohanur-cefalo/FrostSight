@@ -11,6 +11,10 @@ dist/
 .coverage
 htmlcov/
 
+# Prototype: generated data + trained model, regenerate with `python -m prototype.train`
+prototype/artifacts/*.csv
+prototype/artifacts/*.pt
+
 # Databricks
 .databricks/
 .bundle/
