@@ -52,21 +52,75 @@ def _wide_map_bounds() -> tuple[list[float], list[float]]:
 
 app = Dash(__name__)
 app.title = "FrostSight prototype"
+app.index_string = """<!DOCTYPE html>
+<html>
+    <head>
+        {%metas%}
+        <title>{%title%}</title>
+        {%favicon%}
+        <link rel="preconnect" href="https://fonts.googleapis.com">
+        <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+        <style>
+            body { margin: 0; font-family: 'IBM Plex Sans', Arial, sans-serif; }
+            ::-webkit-scrollbar { width: 10px; height: 10px; }
+            ::-webkit-scrollbar-thumb { background: #c3ccd6; border-radius: 6px; }
+        </style>
+        {%css%}
+    </head>
+    <body>
+        {%app_entry%}
+        <footer>{%config%}{%scripts%}{%renderer%}</footer>
+    </body>
+</html>"""
 
 _latest_event_time = df["event_time"].max()
 if _latest_event_time.tzinfo is None:
     _latest_event_time = _latest_event_time.tz_localize("UTC")
 freshness_seconds = (pd.Timestamp.now(tz="UTC") - _latest_event_time).total_seconds()
 
-header = html.Div(
-    [
-        html.H2("FrostSight — icing risk prototype (Troms pilot county)"),
-        html.P(
-            "Synthetic data, PyTorch risk model. Not an official warning service — "
-            f"latest observation {df['event_time'].max():%Y-%m-%d %H:%M UTC}.",
-            style={"color": "#666"},
-        ),
-    ]
+NAVY = "#0d1b2e"
+
+topbar = html.Div(
+    html.Div(
+        [
+            html.Div(
+                [
+                    html.Span("FROSTSIGHT", style={"fontWeight": "700", "fontSize": "18px", "letterSpacing": "1px"}),
+                    html.Span(
+                        "TROMS PILOT · PROTOTYPE",
+                        style={
+                            "fontSize": "11px",
+                            "color": "#93a4bd",
+                            "letterSpacing": "1.5px",
+                            "marginLeft": "12px",
+                            "border": "1px solid #33455e",
+                            "borderRadius": "4px",
+                            "padding": "2px 8px",
+                        },
+                    ),
+                ],
+                style={"display": "flex", "alignItems": "center"},
+            ),
+            html.Div(
+                [
+                    html.Span("● ", style={"color": "#3ddc84"}),
+                    html.Span(
+                        f"Synthetic data · PyTorch risk model · observed {df['event_time'].max():%H:%M UTC}",
+                        style={"color": "#c4cedd", "fontSize": "13px"},
+                    ),
+                ],
+            ),
+        ],
+        style={
+            "display": "flex",
+            "justifyContent": "space-between",
+            "alignItems": "center",
+            "maxWidth": "1400px",
+            "margin": "0 auto",
+            "padding": "16px 24px",
+        },
+    ),
+    style={"background": NAVY, "color": "white"},
 )
 
 
@@ -139,6 +193,22 @@ def build_map_figure(vehicle_step: int | None = None) -> go.Figure:
             )
         )
 
+    # Inline condition callouts on the worst segments, the way operational road-weather
+    # products label map regions directly ("Ice", "-4.8°C") instead of a side legend.
+    worst = route_df.sort_values("ml_risk_score", ascending=False).head(3)
+    fig.add_trace(
+        go.Scattergeo(
+            lon=worst["lon"],
+            lat=worst["lat"],
+            mode="text",
+            text=[f"{r.risk_level} · {r.surface_temp_c:.1f}°C" for r in worst.itertuples()],
+            textfont={"size": 12, "color": "#12233a", "family": "IBM Plex Sans, Arial"},
+            textposition="top center",
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+
     lon_range, lat_range = _wide_map_bounds()
     fig.update_geos(
         scope="europe",
@@ -162,13 +232,27 @@ def build_map_figure(vehicle_step: int | None = None) -> go.Figure:
     return fig
 
 
-def _stat_tile(label: str, value: str):
+def _stat_tile(label: str, value: str, accent: str = "#1565C0"):
     return html.Div(
         [
-            html.P(label, style={"fontSize": "13px", "color": "#6a7179", "margin": "0 0 4px"}),
-            html.P(value, style={"fontSize": "26px", "fontWeight": "600", "margin": 0, "color": "#12233a"}),
+            html.P(
+                label,
+                style={
+                    "fontSize": "11px",
+                    "color": "#6a7179",
+                    "margin": "0 0 6px",
+                    "textTransform": "uppercase",
+                    "letterSpacing": "0.6px",
+                },
+            ),
+            html.P(value, style={"fontSize": "24px", "fontWeight": "600", "margin": 0, "color": "#12233a"}),
         ],
-        style={"background": "#f4f6f8", "borderRadius": "10px", "padding": "12px 16px", "marginBottom": "12px"},
+        style={
+            "background": "#f8f9fb",
+            "borderLeft": f"3px solid {accent}",
+            "borderRadius": "6px",
+            "padding": "10px 16px",
+        },
     )
 
 
@@ -198,9 +282,9 @@ def risk_map_tab():
     n_high = int((df["risk_level"].isin(["HIGH", "VERY_HIGH"])).sum())
     stats = html.Div(
         [
-            _stat_tile("Segments HIGH or above", f"{n_high} of {len(df)}"),
-            _stat_tile("Stations reporting", f"{len(df)} of {len(df)}"),
-            _stat_tile("Data age", f"{freshness_seconds / 60:.0f} min"),
+            _stat_tile("Segments HIGH or above", f"{n_high} of {len(df)}", "#E8590C"),
+            _stat_tile("Stations reporting", f"{len(df)} of {len(df)}", "#2E7D32"),
+            _stat_tile("Data age", f"{freshness_seconds / 60:.0f} min", "#1565C0"),
         ],
         style={"display": "flex", "gap": "12px", "flex": "0 0 auto"},
     )
@@ -337,51 +421,66 @@ def platform_health_tab():
     )
 
 
-TAB_STYLE = {"padding": "10px 4px", "border": "none", "borderBottom": "3px solid transparent"}
-TAB_SELECTED_STYLE = {
-    "padding": "10px 4px",
+TAB_STYLE = {
+    "padding": "12px 4px",
     "border": "none",
-    "borderBottom": "3px solid #1565C0",
-    "color": "#1565C0",
-    "fontWeight": "600",
+    "borderBottom": "3px solid transparent",
+    "fontSize": "13px",
+    "textTransform": "uppercase",
+    "letterSpacing": "0.5px",
+    "color": "#6a7179",
+}
+TAB_SELECTED_STYLE = {
+    **TAB_STYLE,
+    "borderBottom": f"3px solid {NAVY}",
+    "color": NAVY,
+    "fontWeight": "700",
 }
 
 app.layout = html.Div(
-    html.Div(
-        [
-            header,
-            dcc.Tabs(
-                [
-                    dcc.Tab(label="Risk map", children=[risk_map_tab()], style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
-                    dcc.Tab(
-                        label="Road detail", children=[road_detail_tab()], style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE
-                    ),
-                    dcc.Tab(
-                        label="Gritting priority list",
-                        children=[priority_list_tab()],
-                        style=TAB_STYLE,
-                        selected_style=TAB_SELECTED_STYLE,
-                    ),
-                    dcc.Tab(
-                        label="Platform health",
-                        children=[platform_health_tab()],
-                        style=TAB_STYLE,
-                        selected_style=TAB_SELECTED_STYLE,
-                    ),
-                ],
-                style={"marginBottom": "16px"},
+    [
+        topbar,
+        html.Div(
+            html.Div(
+                dcc.Tabs(
+                    [
+                        dcc.Tab(
+                            label="Risk map", children=[risk_map_tab()], style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE
+                        ),
+                        dcc.Tab(
+                            label="Road detail",
+                            children=[road_detail_tab()],
+                            style=TAB_STYLE,
+                            selected_style=TAB_SELECTED_STYLE,
+                        ),
+                        dcc.Tab(
+                            label="Gritting priority list",
+                            children=[priority_list_tab()],
+                            style=TAB_STYLE,
+                            selected_style=TAB_SELECTED_STYLE,
+                        ),
+                        dcc.Tab(
+                            label="Platform health",
+                            children=[platform_health_tab()],
+                            style=TAB_STYLE,
+                            selected_style=TAB_SELECTED_STYLE,
+                        ),
+                    ],
+                    style={"marginBottom": "20px"},
+                ),
+                style={
+                    "maxWidth": "1400px",
+                    "margin": "0 auto",
+                    "background": "white",
+                    "borderRadius": "12px",
+                    "padding": "24px 32px",
+                    "boxShadow": "0 1px 3px rgba(18,35,58,0.08)",
+                },
             ),
-        ],
-        style={
-            "maxWidth": "1400px",
-            "margin": "0 auto",
-            "background": "white",
-            "borderRadius": "16px",
-            "padding": "28px 32px",
-            "boxShadow": "0 1px 3px rgba(18,35,58,0.08)",
-        },
-    ),
-    style={"fontFamily": "'IBM Plex Sans', Arial, sans-serif", "padding": "32px 16px", "background": "#eef1f5", "minHeight": "100vh"},
+            style={"padding": "24px 16px"},
+        ),
+    ],
+    style={"fontFamily": "'IBM Plex Sans', Arial, sans-serif", "background": "#eef1f5", "minHeight": "100vh"},
 )
 
 
