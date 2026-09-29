@@ -171,7 +171,7 @@ def risk_map_tab():
                 style={"color": "#1565C0", "marginLeft": "12px", "fontWeight": "bold"},
             )
         ],
-        style={"marginBottom": "8px"},
+        style={"marginBottom": "12px"},
     )
     n_high = int((df["risk_level"].isin(["HIGH", "VERY_HIGH"])).sum())
     stats = html.Div(
@@ -182,20 +182,66 @@ def risk_map_tab():
         ],
         style={"width": "220px", "flexShrink": 0},
     )
+    top5 = df.sort_values("ml_risk_score", ascending=False).head(5)
+    watchlist = html.Div(
+        [
+            html.P("Top risk right now", style={"fontSize": "13px", "color": "#6a7179", "margin": "0 0 8px"}),
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Span(
+                                row["risk_level"],
+                                style={
+                                    "backgroundColor": RISK_COLORS[row["risk_level"]],
+                                    "color": "white",
+                                    "borderRadius": "4px",
+                                    "padding": "1px 6px",
+                                    "fontSize": "11px",
+                                    "marginRight": "8px",
+                                },
+                            ),
+                            html.Span(f"{row['road_segment_id']} · {row['drivers']}", style={"fontSize": "13px"}),
+                        ],
+                        style={"padding": "6px 0", "borderBottom": "1px solid #e5e9ee"},
+                    )
+                    for _, row in top5.iterrows()
+                ]
+            ),
+        ],
+        style={"width": "220px", "flexShrink": 0},
+    )
     return html.Div(
         [
             legend,
             html.Div(
                 [
                     stats,
-                    dcc.Graph(
-                        id="risk-map-graph",
-                        figure=build_map_figure(0),
-                        config={"displayModeBar": False},
-                        style={"flex": 1},
+                    html.Div(
+                        dcc.Graph(
+                            id="risk-map-graph",
+                            figure=build_map_figure(0),
+                            config={"displayModeBar": False},
+                            style={"height": "560px", "width": "420px"},
+                        ),
+                        style={
+                            "flex": "0 0 420px",
+                            "background": "#fbfcfd",
+                            "border": "1px solid #d8dee6",
+                            "borderRadius": "12px",
+                            "padding": "8px",
+                            "overflow": "hidden",
+                        },
                     ),
+                    watchlist,
                 ],
-                style={"display": "flex", "gap": "20px", "alignItems": "flex-start"},
+                style={
+                    "display": "flex",
+                    "gap": "20px",
+                    "alignItems": "flex-start",
+                    "justifyContent": "center",
+                    "flexWrap": "wrap",
+                },
             ),
             dcc.Interval(id="vehicle-interval", interval=2000, n_intervals=0),
         ]
@@ -279,19 +325,51 @@ def platform_health_tab():
     )
 
 
+TAB_STYLE = {"padding": "10px 4px", "border": "none", "borderBottom": "3px solid transparent"}
+TAB_SELECTED_STYLE = {
+    "padding": "10px 4px",
+    "border": "none",
+    "borderBottom": "3px solid #1565C0",
+    "color": "#1565C0",
+    "fontWeight": "600",
+}
+
 app.layout = html.Div(
-    [
-        header,
-        dcc.Tabs(
-            [
-                dcc.Tab(label="Risk map", children=[risk_map_tab()]),
-                dcc.Tab(label="Road detail", children=[road_detail_tab()]),
-                dcc.Tab(label="Gritting priority list", children=[priority_list_tab()]),
-                dcc.Tab(label="Platform health", children=[platform_health_tab()]),
-            ]
-        ),
-    ],
-    style={"fontFamily": "sans-serif", "padding": "16px"},
+    html.Div(
+        [
+            header,
+            dcc.Tabs(
+                [
+                    dcc.Tab(label="Risk map", children=[risk_map_tab()], style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
+                    dcc.Tab(
+                        label="Road detail", children=[road_detail_tab()], style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE
+                    ),
+                    dcc.Tab(
+                        label="Gritting priority list",
+                        children=[priority_list_tab()],
+                        style=TAB_STYLE,
+                        selected_style=TAB_SELECTED_STYLE,
+                    ),
+                    dcc.Tab(
+                        label="Platform health",
+                        children=[platform_health_tab()],
+                        style=TAB_STYLE,
+                        selected_style=TAB_SELECTED_STYLE,
+                    ),
+                ],
+                style={"marginBottom": "16px"},
+            ),
+        ],
+        style={
+            "maxWidth": "1100px",
+            "margin": "0 auto",
+            "background": "white",
+            "borderRadius": "16px",
+            "padding": "28px 32px",
+            "boxShadow": "0 1px 3px rgba(18,35,58,0.08)",
+        },
+    ),
+    style={"fontFamily": "'IBM Plex Sans', Arial, sans-serif", "padding": "32px 16px", "background": "#eef1f5", "minHeight": "100vh"},
 )
 
 
