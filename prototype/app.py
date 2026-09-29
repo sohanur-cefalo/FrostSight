@@ -46,16 +46,18 @@ header = html.Div(
 
 
 def risk_map_tab():
+    # Plain lon/lat scatter, not scattermapbox: no basemap tiles to fetch, renders offline.
     fig = {
         "data": [
             {
-                "type": "scattermapbox",
-                "lat": df["lat"],
-                "lon": df["lon"],
+                "type": "scatter",
+                "x": df["lon"],
+                "y": df["lat"],
                 "mode": "markers",
                 "marker": {
-                    "size": 14,
+                    "size": 16,
                     "color": [RISK_COLORS[lvl] for lvl in df["risk_level"]],
+                    "line": {"width": 1, "color": "white"},
                 },
                 "text": df["road_segment_id"] + " — " + df["risk_level"],
                 "hovertemplate": "%{text}<br>score=%{customdata:.2f}<extra></extra>",
@@ -63,13 +65,11 @@ def risk_map_tab():
             }
         ],
         "layout": {
-            "mapbox": {
-                "style": "carto-positron",
-                "center": {"lat": float(df["lat"].mean()), "lon": float(df["lon"].mean())},
-                "zoom": 7,
-            },
-            "margin": {"l": 0, "r": 0, "t": 0, "b": 0},
+            "xaxis": {"title": "longitude", "zeroline": False},
+            "yaxis": {"title": "latitude", "zeroline": False, "scaleanchor": "x"},
+            "margin": {"l": 60, "r": 20, "t": 10, "b": 40},
             "height": 520,
+            "plot_bgcolor": "#eef2f6",
         },
     }
     legend = html.Div(
