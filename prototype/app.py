@@ -10,6 +10,7 @@ Run: python -m prototype.app
 from __future__ import annotations
 
 import pandas as pd
+import plotly.graph_objects as go
 from dash import Dash, Input, Output, dash_table, dcc, html
 
 from prototype.risk import score_segments
@@ -24,6 +25,10 @@ RISK_ORDER = ["LOW", "MEDIUM", "HIGH", "VERY_HIGH"]
 
 df = score_segments()
 obs = pd.read_csv("prototype/artifacts/observations.csv", parse_dates=["event_time"])
+
+# The synthetic segments are generated in order along the Tromsø -> Bardufoss corridor
+# (generate_data.py), so sorting by id recovers the physical road path.
+route_df = df.sort_values("road_segment_id").reset_index(drop=True)
 
 app = Dash(__name__)
 app.title = "FrostSight prototype"
@@ -45,33 +50,107 @@ header = html.Div(
 )
 
 
-def risk_map_tab():
-    # Plain lon/lat scatter, not scattermapbox: no basemap tiles to fetch, renders offline.
-    fig = {
-        "data": [
-            {
-                "type": "scatter",
-                "x": df["lon"],
-                "y": df["lat"],
-                "mode": "markers",
-                "marker": {
-                    "size": 16,
-                    "color": [RISK_COLORS[lvl] for lvl in df["risk_level"]],
-                    "line": {"width": 1, "color": "white"},
-                },
-                "text": df["road_segment_id"] + " — " + df["risk_level"],
-                "hovertemplate": "%{text}<br>score=%{customdata:.2f}<extra></extra>",
-                "customdata": df["ml_risk_score"],
-            }
+def build_map_figure(vehicle_step: int | None = None) -> go.Figure:
+    """Norway/Troms basemap (Plotly's bundled coastline vectors, no tile server needed),
+    the pilot-county road drawn as a path coloured per segment by risk, and an optional
+    simulated gritting-truck position moving along that path in real time.
+    """
+    fig = go.Figure()
+
+    # Road path: one line trace per segment-to-segment hop, coloured by that hop's risk,
+    # so the whole corridor reads like the priority list laid over the map.
+    for i in range(len(route_df) - 1):
+        a, b = route_df.iloc[i], route_df.iloc[i + 1]
+        fig.add_trace(
+            go.Scattergeo(
+                lon=[a["lon"], b["lon"]],
+                lat=[a["lat"], b["lat"]],
+                mode="lines",
+                line={"width": 5, "color": RISK_COLORS[a["risk_level"]]},
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+
+    # Traveled portion of the route so far, drawn as a thick outline on top of the path.
+    if vehicle_step:
+        traveled = route_df.iloc[: vehicle_step + 1]
+        fig.add_trace(
+            go.Scattergeo(
+                lon=traveled["lon"],
+                lat=traveled["lat"],
+                mode="lines",
+                line={"width": 2, "color": "#12233a", "dash": "dot"},
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+
+    fig.add_trace(
+        go.Scattergeo(
+            lon=route_df["lon"],
+            lat=route_df["lat"],
+            mode="markers",
+            marker={
+                "size": 11,
+                "color": [RISK_COLORS[lvl] for lvl in route_df["risk_level"]],
+                "line": {"width": 1, "color": "white"},
+            },
+            text=route_df["road_segment_id"] + " — " + route_df["risk_level"],
+            customdata=route_df["ml_risk_score"],
+            hovertemplate="%{text}<br>score=%{customdata:.2f}<extra></extra>",
+            name="Segments",
+            showlegend=False,
+        )
+    )
+
+    if vehicle_step is not None:
+        pos = route_df.iloc[vehicle_step % len(route_df)]
+        fig.add_trace(
+            go.Scattergeo(
+                lon=[pos["lon"]],
+                lat=[pos["lat"]],
+                mode="markers",
+                marker={"size": 18, "color": "#1565C0", "symbol": "triangle-up", "line": {"width": 2, "color": "white"}},
+                text=[f"Gritting unit — near {pos['road_segment_id']}"],
+                hovertemplate="%{text}<extra></extra>",
+                name="Gritting unit (simulated GPS)",
+                showlegend=False,
+            )
+        )
+
+    fig.update_geos(
+        scope="europe",
+        resolution=50,
+        projection_type="mercator",
+        fitbounds="locations",
+        showland=True,
+        landcolor="#eef2f6",
+        showocean=True,
+        oceancolor="#dbe7f2",
+        showlakes=True,
+        lakecolor="#dbe7f2",
+        showcountries=True,
+        countrycolor="#9aa5b1",
+        showsubunits=True,
+        subunitcolor="#c3ccd6",
+        showframe=False,
+    )
+    fig.update_layout(margin={"l": 0, "r": 0, "t": 0, "b": 0}, height=520)
+    return fig
+
+
+def _stat_tile(label: str, value: str):
+    return html.Div(
+        [
+            html.P(label, style={"fontSize": "13px", "color": "#6a7179", "margin": "0 0 4px"}),
+            html.P(value, style={"fontSize": "26px", "fontWeight": "600", "margin": 0, "color": "#12233a"}),
         ],
-        "layout": {
-            "xaxis": {"title": "longitude", "zeroline": False},
-            "yaxis": {"title": "latitude", "zeroline": False, "scaleanchor": "x"},
-            "margin": {"l": 60, "r": 20, "t": 10, "b": 40},
-            "height": 520,
-            "plot_bgcolor": "#eef2f6",
-        },
-    }
+        style={"background": "#f4f6f8", "borderRadius": "10px", "padding": "12px 16px", "marginBottom": "12px"},
+    )
+
+
+def risk_map_tab():
     legend = html.Div(
         [
             html.Span(
@@ -85,10 +164,50 @@ def risk_map_tab():
                 },
             )
             for lvl in RISK_ORDER
+        ]
+        + [
+            html.Span(
+                " ▲ gritting unit (simulated GPS, moves every 2s) ",
+                style={"color": "#1565C0", "marginLeft": "12px", "fontWeight": "bold"},
+            )
         ],
         style={"marginBottom": "8px"},
     )
-    return html.Div([legend, dcc.Graph(figure=fig, config={"displayModeBar": False})])
+    n_high = int((df["risk_level"].isin(["HIGH", "VERY_HIGH"])).sum())
+    stats = html.Div(
+        [
+            _stat_tile("Segments HIGH or above", f"{n_high} of {len(df)}"),
+            _stat_tile("Stations reporting", f"{len(df)} of {len(df)}"),
+            _stat_tile("Data age", f"{freshness_seconds / 60:.0f} min"),
+        ],
+        style={"width": "220px", "flexShrink": 0},
+    )
+    return html.Div(
+        [
+            legend,
+            html.Div(
+                [
+                    stats,
+                    dcc.Graph(
+                        id="risk-map-graph",
+                        figure=build_map_figure(0),
+                        config={"displayModeBar": False},
+                        style={"flex": 1},
+                    ),
+                ],
+                style={"display": "flex", "gap": "20px", "alignItems": "flex-start"},
+            ),
+            dcc.Interval(id="vehicle-interval", interval=2000, n_intervals=0),
+        ]
+    )
+
+
+@app.callback(
+    Output("risk-map-graph", "figure"),
+    Input("vehicle-interval", "n_intervals"),
+)
+def update_vehicle_position(n_intervals: int):
+    return build_map_figure(n_intervals % len(route_df))
 
 
 def road_detail_tab():
