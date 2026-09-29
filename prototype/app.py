@@ -9,6 +9,8 @@ Run: python -m prototype.app
 
 from __future__ import annotations
 
+import math
+
 import pandas as pd
 import plotly.graph_objects as go
 from dash import Dash, Input, Output, dash_table, dcc, html
@@ -29,6 +31,24 @@ obs = pd.read_csv("prototype/artifacts/observations.csv", parse_dates=["event_ti
 # The synthetic segments are generated in order along the Tromsø -> Bardufoss corridor
 # (generate_data.py), so sorting by id recovers the physical road path.
 route_df = df.sort_values("road_segment_id").reset_index(drop=True)
+
+MAP_ASPECT = 2.1  # width:height target so the full-screen map reads as a landscape panel
+
+
+def _wide_map_bounds() -> tuple[list[float], list[float]]:
+    """Lon/lat range padded so the map fills a wide panel with real surrounding
+    coastline instead of a narrow strip hugging just the road corridor."""
+    lat_min, lat_max = route_df["lat"].min(), route_df["lat"].max()
+    lon_min, lon_max = route_df["lon"].min(), route_df["lon"].max()
+    lat_span = (lat_max - lat_min) * 1.3
+    lat_mid = (lat_max + lat_min) / 2
+    lon_span_needed = MAP_ASPECT * lat_span / math.cos(math.radians(lat_mid))
+    lon_span = max((lon_max - lon_min) * 1.3, lon_span_needed)
+    lon_mid = (lon_max + lon_min) / 2
+    return (
+        [lon_mid - lon_span / 2, lon_mid + lon_span / 2],
+        [lat_mid - lat_span / 2, lat_mid + lat_span / 2],
+    )
 
 app = Dash(__name__)
 app.title = "FrostSight prototype"
@@ -119,11 +139,13 @@ def build_map_figure(vehicle_step: int | None = None) -> go.Figure:
             )
         )
 
+    lon_range, lat_range = _wide_map_bounds()
     fig.update_geos(
         scope="europe",
         resolution=50,
         projection_type="mercator",
-        fitbounds="locations",
+        lonaxis_range=lon_range,
+        lataxis_range=lat_range,
         showland=True,
         landcolor="#eef2f6",
         showocean=True,
@@ -136,7 +158,7 @@ def build_map_figure(vehicle_step: int | None = None) -> go.Figure:
         subunitcolor="#c3ccd6",
         showframe=False,
     )
-    fig.update_layout(margin={"l": 0, "r": 0, "t": 0, "b": 0}, height=520)
+    fig.update_layout(margin={"l": 0, "r": 0, "t": 0, "b": 0}, autosize=True)
     return fig
 
 
@@ -180,67 +202,57 @@ def risk_map_tab():
             _stat_tile("Stations reporting", f"{len(df)} of {len(df)}"),
             _stat_tile("Data age", f"{freshness_seconds / 60:.0f} min"),
         ],
-        style={"width": "220px", "flexShrink": 0},
+        style={"display": "flex", "gap": "12px", "flex": "0 0 auto"},
     )
     top5 = df.sort_values("ml_risk_score", ascending=False).head(5)
     watchlist = html.Div(
-        [
-            html.P("Top risk right now", style={"fontSize": "13px", "color": "#6a7179", "margin": "0 0 8px"}),
-            html.Div(
+        [html.Span("Top risk now: ", style={"fontSize": "13px", "color": "#6a7179", "marginRight": "6px"})]
+        + [
+            html.Span(
                 [
-                    html.Div(
-                        [
-                            html.Span(
-                                row["risk_level"],
-                                style={
-                                    "backgroundColor": RISK_COLORS[row["risk_level"]],
-                                    "color": "white",
-                                    "borderRadius": "4px",
-                                    "padding": "1px 6px",
-                                    "fontSize": "11px",
-                                    "marginRight": "8px",
-                                },
-                            ),
-                            html.Span(f"{row['road_segment_id']} · {row['drivers']}", style={"fontSize": "13px"}),
-                        ],
-                        style={"padding": "6px 0", "borderBottom": "1px solid #e5e9ee"},
-                    )
-                    for _, row in top5.iterrows()
+                    html.Span(
+                        row["risk_level"],
+                        style={
+                            "backgroundColor": RISK_COLORS[row["risk_level"]],
+                            "color": "white",
+                            "borderRadius": "4px",
+                            "padding": "1px 6px",
+                            "fontSize": "11px",
+                            "marginRight": "4px",
+                        },
+                    ),
+                    html.Span(f"{row['road_segment_id']}", style={"fontSize": "13px", "marginRight": "12px"}),
                 ]
-            ),
+            )
+            for _, row in top5.iterrows()
         ],
-        style={"width": "220px", "flexShrink": 0},
+        style={"display": "flex", "flexWrap": "wrap", "alignItems": "center", "flex": "1 1 300px"},
     )
     return html.Div(
         [
-            legend,
             html.Div(
-                [
-                    stats,
-                    html.Div(
-                        dcc.Graph(
-                            id="risk-map-graph",
-                            figure=build_map_figure(0),
-                            config={"displayModeBar": False},
-                            style={"height": "560px", "width": "420px"},
-                        ),
-                        style={
-                            "flex": "0 0 420px",
-                            "background": "#fbfcfd",
-                            "border": "1px solid #d8dee6",
-                            "borderRadius": "12px",
-                            "padding": "8px",
-                            "overflow": "hidden",
-                        },
-                    ),
-                    watchlist,
-                ],
+                [stats, watchlist],
                 style={
                     "display": "flex",
-                    "gap": "20px",
-                    "alignItems": "flex-start",
-                    "justifyContent": "center",
+                    "gap": "24px",
+                    "alignItems": "center",
                     "flexWrap": "wrap",
+                    "marginBottom": "12px",
+                },
+            ),
+            legend,
+            html.Div(
+                dcc.Graph(
+                    id="risk-map-graph",
+                    figure=build_map_figure(0),
+                    config={"displayModeBar": False, "responsive": True},
+                    style={"height": "78vh", "width": "100%"},
+                ),
+                style={
+                    "background": "#fbfcfd",
+                    "border": "1px solid #d8dee6",
+                    "borderRadius": "12px",
+                    "padding": "8px",
                 },
             ),
             dcc.Interval(id="vehicle-interval", interval=2000, n_intervals=0),
@@ -361,7 +373,7 @@ app.layout = html.Div(
             ),
         ],
         style={
-            "maxWidth": "1100px",
+            "maxWidth": "1400px",
             "margin": "0 auto",
             "background": "white",
             "borderRadius": "16px",
