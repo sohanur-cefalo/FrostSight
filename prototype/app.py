@@ -9,14 +9,29 @@ Run: python -m prototype.app
 
 from __future__ import annotations
 
+import json
 import math
+import os
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from dash import Dash, Input, Output, dash_table, dcc, html
 
+from prototype.provenance import describe_sources
 from prototype.risk import score_segments
+
+ROAD_LINKS_PATH = "prototype/artifacts/road_links.json"
+
+
+def load_road_links() -> list[dict]:
+    """Real road-link geometry (prototype/build_road_network.py, Phase 1b of
+    docs/adr/0006-real-data-integration.md). Empty list — not an error — if that
+    build step hasn't been run, so the map falls back to the station-point view."""
+    if not os.path.exists(ROAD_LINKS_PATH):
+        return []
+    with open(ROAD_LINKS_PATH) as f:
+        return json.load(f)
 
 RISK_COLORS = {
     "LOW": "#2E7D32",       # good
@@ -28,6 +43,7 @@ RISK_ORDER = ["LOW", "MEDIUM", "HIGH", "VERY_HIGH"]
 
 df = score_segments()
 obs = pd.read_csv("prototype/artifacts/observations.csv", parse_dates=["event_time"])
+road_links = load_road_links()
 
 # The synthetic segments are generated in order along the Tromsø -> Bardufoss corridor
 # (generate_data.py), so sorting by id recovers the physical road path.
@@ -92,7 +108,10 @@ app.index_string = """<!DOCTYPE html>
 _latest_event_time = df["event_time"].max()
 if _latest_event_time.tzinfo is None:
     _latest_event_time = _latest_event_time.tz_localize("UTC")
-freshness_seconds = (pd.Timestamp.now(tz="UTC") - _latest_event_time).total_seconds()
+# max(0, ...): df's event_time is each segment's closest-to-now reading, which
+# for forecast data (build_live_weather.py, Phase 2) can land a few minutes in
+# the future between hourly forecast ticks — "age" should never read negative.
+freshness_seconds = max(0.0, (pd.Timestamp.now(tz="UTC") - _latest_event_time).total_seconds())
 
 NAVY = "#0d1b2e"
 
@@ -121,7 +140,7 @@ topbar = html.Div(
                 [
                     html.Span("● ", style={"color": "#3ddc84"}),
                     html.Span(
-                        f"Synthetic data · PyTorch risk model · observed {df['event_time'].max():%H:%M UTC}",
+                        f"{describe_sources()} · PyTorch risk model · observed {df['event_time'].max():%H:%M UTC}",
                         style={"color": "#c4cedd", "fontSize": "13px"},
                     ),
                 ],
@@ -209,6 +228,57 @@ class RoadMapView:
             )
         self._track_extent(route_df["lon"], route_df["lat"])
 
+    def plot_road_network(self, road_links: list[dict], route_df: pd.DataFrame) -> None:
+        """Real road-link geometry (prototype/build_road_network.py, Phase 1b),
+        each link colored by its nearest real weather station's current risk
+        level — since we only have weather readings at 30 points, not
+        continuously along the road. One trace per risk level (not per link):
+        Plotly draws many disconnected line segments in a single Scattermap
+        trace by separating them with a `None` coordinate, which keeps this to
+        4 traces instead of one per link (hundreds), for render performance."""
+        station_lats = route_df["lat"].to_numpy()
+        station_lons = route_df["lon"].to_numpy()
+        station_risk = route_df["risk_level"].to_numpy()
+
+        by_risk: dict[str, dict[str, list]] = {lvl: {"lon": [], "lat": []} for lvl in RISK_ORDER}
+        for link in road_links:
+            coords = link["coords"]
+            mid = coords[len(coords) // 2]
+            distances = self._haversine_vec(mid["lat"], mid["lon"], station_lats, station_lons)
+            nearest_risk = station_risk[distances.argmin()]
+
+            bucket = by_risk[nearest_risk]
+            bucket["lon"].extend(c["lon"] for c in coords)
+            bucket["lat"].extend(c["lat"] for c in coords)
+            bucket["lon"].append(None)  # break so consecutive links don't connect
+            bucket["lat"].append(None)
+            self._track_extent([c["lon"] for c in coords], [c["lat"] for c in coords])
+
+        for risk_level in RISK_ORDER:
+            bucket = by_risk[risk_level]
+            if not bucket["lon"]:
+                continue
+            self.fig.add_trace(
+                go.Scattermap(
+                    lon=bucket["lon"],
+                    lat=bucket["lat"],
+                    mode="lines",
+                    line={"width": 6, "color": RISK_COLORS[risk_level]},
+                    name=risk_level,
+                    hoverinfo="skip",
+                    showlegend=False,
+                )
+            )
+
+    @staticmethod
+    def _haversine_vec(lat1: float, lon1: float, lats2: np.ndarray, lons2: np.ndarray) -> np.ndarray:
+        r = 6371.0
+        p1, p2 = math.radians(lat1), np.radians(lats2)
+        dp = np.radians(lats2 - lat1)
+        dl = np.radians(lons2 - lon1)
+        a = np.sin(dp / 2) ** 2 + math.cos(p1) * np.cos(p2) * np.sin(dl / 2) ** 2
+        return 2 * r * np.arcsin(np.sqrt(a))
+
     def plot_traveled(self, route_df: pd.DataFrame, vehicle_step: int) -> None:
         """Thick dotted outline over the portion of the route already covered."""
         if not vehicle_step:
@@ -284,14 +354,21 @@ class RoadMapView:
         )
 
 
-def build_map_figure(route_df: pd.DataFrame, vehicle_step: int | None = None) -> go.Figure:
-    """Real OpenStreetMap tiles (Scattermapbox, no Mapbox token needed), the
-    pilot-county road drawn as a path coloured per segment by risk, and an
-    optional simulated gritting-truck position moving along that path in
-    real time — the same rendering approach as wsd-dashboard's cable map.
+def build_map_figure(
+    route_df: pd.DataFrame, vehicle_step: int | None = None, road_links: list[dict] | None = None
+) -> go.Figure:
+    """Real OpenStreetMap tiles (Scattermap, no Mapbox token needed), the
+    pilot-county road network drawn as real link geometry colored by the
+    nearest station's risk (Phase 1b) when road_links is available, else the
+    coarser station-to-station connector lines (Phase 1), and an optional
+    simulated gritting-truck position moving along the route in real time —
+    the same rendering approach as wsd-dashboard's cable map.
     """
     map_view = RoadMapView()
-    map_view.plot_roads(route_df)
+    if road_links:
+        map_view.plot_road_network(road_links, route_df)
+    else:
+        map_view.plot_roads(route_df)
     map_view.plot_traveled(route_df, vehicle_step or 0)
     map_view.plot_segment_markers(route_df)
     if vehicle_step is not None:
@@ -435,10 +512,18 @@ def risk_map_tab():
                         id="risk-map-loading",
                         type="circle",
                         color=NAVY,
+                        # The 2s vehicle-interval tick and the local CSV re-read on
+                        # refresh both resolve in a few ms — without delay_show,
+                        # dcc.Loading's opaque overlay flashes over the map on every
+                        # tick, which is what reads as the dashboard "blipping".
+                        # Only show it for a genuinely slow update (>400ms).
+                        delay_show=400,
+                        delay_hide=200,
+                        overlay_style={"visibility": "visible", "opacity": 0.3},
                         children=dcc.Graph(
                             id="risk-map-graph",
-                            figure=build_map_figure(route_df, 0),
-                            config={"displayModeBar": False, "responsive": True},
+                            figure=build_map_figure(route_df, 0, road_links),
+                            config={"displayModeBar": False, "responsive": True, "scrollZoom": True},
                             style={"height": "78vh", "width": "100%"},
                         ),
                     ),
@@ -467,9 +552,10 @@ def risk_map_tab():
 def on_map_reload(_n_intervals, _n_clicks):
     """Re-fetch/re-score road data and rebuild the map — the road-map analogue
     of wsd-dashboard's on_page_load_interval / on_overview_map_refresh_button_click."""
-    global route_df
+    global route_df, road_links
     route_df = load_route_df()
-    return build_map_figure(route_df, 0)
+    road_links = load_road_links()
+    return build_map_figure(route_df, 0, road_links)
 
 
 @app.callback(
@@ -477,7 +563,7 @@ def on_map_reload(_n_intervals, _n_clicks):
     Input("vehicle-interval", "n_intervals"),
 )
 def update_vehicle_position(n_intervals: int):
-    return build_map_figure(route_df, n_intervals % len(route_df))
+    return build_map_figure(route_df, n_intervals % len(route_df), road_links)
 
 
 def road_detail_tab():

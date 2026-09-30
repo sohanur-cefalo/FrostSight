@@ -47,44 +47,80 @@ of blocking on the slowest account approval.
 
 Option 2. Three phases, each independently useful and each keeping the existing CSV contract:
 
-### Phase 1 — real road geometry and terrain (no registration; can start now)
+### Phase 1 — real station geometry and terrain (done; no registration)
 
-Add `collector/nvdb.py` (the module `docs/plan/02_M1_history_and_reference_data.md` T1.3 already designs
-in detail — reuse its pagination/CRS logic, but write flat CSVs into `prototype/artifacts/` instead of a
-Databricks landing volume):
+`collector/nvdb.py` + `prototype/build_dataset.py`:
 
-- Pull Troms road links (`vegnett/veglenkesekvenser/segmentert`, `fylke=55`) and road-weather station
-  points (`vegobjekter/153`).
-- Reproject NVDB's default WKT (EPSG:25833 / UTM 33N) to WGS84 with `pyproj.Transformer` (snippet already
-  in the M1 plan doc) — this is what actually fixes the map, replacing interpolated fake coordinates with
-  the real E8/E6 corridor shape.
-- Segment the road by snapping to the 30 real station locations (one segment per station's nearest road
-  link chunk) instead of 30 arbitrary interpolated points — this makes `road_segment_id` map to a real,
-  identifiable place.
-- Take `elevation_m` from the real Z coordinate in NVDB geometry (fallback: Open-Meteo elevation API, per
-  `docs/source-verification.md` finding 3).
-- `exposure_factor` stays a documented placeholder (ADR-0001), but derive it from real terrain (elevation
-  variance / coastal distance around each real segment) instead of `RNG.normal`.
-- Output: a real `segments.csv` with the same columns as today. `observations.csv` still synthetic at
-  this point, but now generated over real coordinates/elevation so the storm simulation is at least sited
-  correctly.
+- Pull Troms road-weather station points (`vegobjekter/153`, `fylke=55`) — 30 stations, matching
+  `docs/source-verification.md`'s count.
+- Reproject NVDB's default WKT (EPSG:5973/25833, UTM 33N) to WGS84 with `pyproj.Transformer` — this is
+  what actually fixes the map, replacing interpolated fake coordinates with real station locations across
+  Troms (`road_name` carries the real route, e.g. "E6 · Nordnes").
+- `elevation_m` from Open-Meteo (NVDB's station points carry no Z; the M1 plan's Z-from-geometry idea only
+  applies to line/road objects, not point stations — this ADR's original wording was wrong on that point).
+- `exposure_factor` stays a documented placeholder (ADR-0001), derived from real elevation instead of
+  `RNG.normal`.
+- Output: a real `segments.csv`, one row per real station (not a snapped road-link chunk — see Phase 1b for
+  why that distinction matters). `observations.csv` still synthetic at this point.
 
-Acceptance: NVDB extract matches `docs/source-verification.md` counts (30 stations, road links in the
-tens of thousands for Troms); map in `app.py` shows the real road path instead of a straight interpolated
-line.
+Acceptance (met): NVDB extract returns 30 stations for Troms; `app.py`'s map shows real station locations
+instead of an interpolated line.
 
-### Phase 2 — real live weather inputs (no registration; can start now, independent of Phase 1)
+### Phase 1b — real road-link geometry, colored by nearest station (done; no registration)
 
-Add `collector/met.py` calling MET Locationforecast per real station coordinate (from Phase 1) to get live
-`air_temp_c`, `wind_speed_ms`, `precip_mm`. This replaces the synthetic storm curve with a real (if
-forecast-based, not observed) weather signal. `surface_temp_c` is approximated from air temp with the
-existing documented offset heuristic
+Phase 1 alone only gives 30 points, not a road *shape* — real stations don't sit on one connected
+corridor the way the synthetic route did, so the map could only draw sparse dots (see the "known limits"
+discussion this phase resolves). `collector/nvdb.py`'s `fetch_road_links_near_stations()` +
+`prototype/build_road_network.py` close that gap:
+
+- Pull real road-link LineString geometry (`vegnett/veglenkesekvenser/segmentert`) filtered to the
+  specific numbered routes our 30 stations sit on (`vegsystemreferanse=EV6` etc.), not the whole county's
+  road network — demo scope, ~750 links for our 30 stations vs. "tens of thousands" for all of Troms.
+- Kept only if within 12 km of at least one station (`max_distance_km`), and pedestrian/bike links
+  (`typeVeg` containing "sykkel"/"gang") are dropped — this is vehicle road criticality, not a full
+  transport network.
+- Each kept link is colored by its **nearest** real station's current risk level (haversine to all 30
+  stations) — a spatial nearest-neighbor match, since we still only have weather readings at 30 points,
+  not continuously along the road. Rendered as one Scattermap trace per risk level (not per link, for
+  render performance), each trace's coordinate list broken into disconnected line segments with `None`.
+- Output: `prototype/artifacts/road_links.json` — a separate artifact from `segments.csv`, loaded by
+  `app.py` if present (falls back to Phase 1's sparse station-connector view if absent).
+
+Acceptance (met): live-tested at 25s / 748 links for all 30 stations; map shows real road-link geometry
+(verified visually — dashed lines correctly hug the real coastal road shape near Tromsø) colored by risk.
+
+**Post-MVP scaling note:** this stays demo-scoped (Troms, station-radius-filtered) on purpose. National
+scale means dropping the per-station radius filter and loading every county's road network — at that
+point embedding full line geometry client-side in a Plotly figure won't scale; the road network would
+need to be served as vector tiles (e.g. via a tile server) instead of shipped as inline JSON, and this
+ADR's nearest-station coloring approach would need a proper spatial index (e.g. a k-d tree or PostGIS)
+rather than an O(links × stations) haversine loop.
+
+### Phase 2 — real live weather inputs (done; no registration)
+
+`collector/met.py` + `prototype/build_live_weather.py`: calls MET Locationforecast per real station
+coordinate (from Phase 1) to get live `air_temp_c`, `wind_speed_ms`, `precip_mm`. This replaces the
+synthetic storm curve with a real (if forecast-based, not observed) weather signal. `surface_temp_c` is
+approximated from air temp with the existing documented offset heuristic
 (`surface_temp ≈ air_temp - 1.0 - 1.5 * exposure_factor`, already in `generate_data.py`) until Phase 3
-lands the real sensor value — label this column clearly as approximated in the dashboard/README, not
-silently swapped for ground truth.
+lands the real sensor value — labeled as approximated in `prototype/README.md`'s known limits, not
+silently swapped for ground truth. `prototype/provenance.py` tracks which of segments/observations are
+real vs. synthetic so the dashboard's topbar states it accurately instead of a hardcoded label.
 
-Acceptance: `observations.csv` populated from live MET calls for all real Phase-1 segments; dashboard
-"data freshness" reflects real MET response timestamps.
+Two correctness issues surfaced by using genuinely forward-looking (forecast) data instead of historical
+data, both fixed: `risk.py` used to pick a segment's *max* `event_time` as "current," which is right for
+past-observation data but picks the *most future* forecast point otherwise — now picks whichever reading
+is closest to now. And `train.py`/`risk.py`'s trend feature used a hardcoded `diff(6)` assuming fixed
+10-minute spacing — replaced with `prototype/features.py`'s time-aware version (`pandas.merge_asof`
+against an actual 1-hour window) that works regardless of the data source's cadence. Also: the model is
+now always trained on a freshly generated broad synthetic distribution, never on whatever's staged for
+serving — a live forecast snapshot is one moment in time across 30 segments (often uniformly low risk on
+a mild day), and training on it directly would collapse the model into "always low risk" instead of
+learning the general weather-to-risk relationship.
+
+Acceptance (met): live-tested — `observations.csv` populated from live MET calls for all 30 real
+Phase-1 stations; dashboard correctly showed all-LOW risk on an actual mild Troms day, confirming it's
+scoring real conditions rather than replaying a canned pattern.
 
 ### Phase 3 — real historical + live surface temperature (blocked on registration)
 

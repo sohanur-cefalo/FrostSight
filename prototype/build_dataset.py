@@ -21,6 +21,7 @@ import pandas as pd
 from collector.elevation import fetch_elevations
 from collector.nvdb import fetch_stations
 from prototype.generate_data import make_observations
+from prototype.provenance import write_meta
 
 log = logging.getLogger("prototype.build_dataset")
 
@@ -66,6 +67,7 @@ def main() -> None:
     observations = make_observations(segments)
     segments.to_csv("prototype/artifacts/segments.csv", index=False)
     observations.to_csv("prototype/artifacts/observations.csv", index=False)
+    write_meta(segments_source="real_nvdb", observations_source="synthetic")
     log.info(
         "Wrote %d real NVDB segments and %d synthetic observations to prototype/artifacts/",
         len(segments),

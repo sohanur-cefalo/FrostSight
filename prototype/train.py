@@ -1,4 +1,14 @@
-"""Generate synthetic data (if missing) and train the PyTorch icing-risk model.
+"""Train the PyTorch icing-risk model on a broad synthetic weather distribution.
+
+Training always uses a freshly generated synthetic segments/observations set
+(generate_data.py), independent of whatever's currently in artifacts/segments.csv
+/observations.csv for serving. This matters once real data is involved: a live
+MET forecast snapshot (build_live_weather.py, Phase 2) covers one moment in
+time across 30 segments — often near-zero variance in risk (e.g. a mild day) —
+so training on it directly would collapse the model into "always low risk"
+instead of learning the general relationship between weather and icing risk.
+The trained model is then used to score whatever real or synthetic data is
+staged for serving (risk.py), same as any train/serve split.
 
 Usage: python -m prototype.train
 """
@@ -9,15 +19,15 @@ import pandas as pd
 import torch
 from torch import nn
 
-from prototype.generate_data import main as generate_data
+from prototype.features import add_surface_temp_trend_1h
+from prototype.generate_data import make_observations, make_segments
 from prototype.model import FEATURE_COLUMNS, IcingRiskNet
 
 ARTIFACTS = "prototype/artifacts"
 
 
 def _add_features(obs: pd.DataFrame, segments: pd.DataFrame) -> pd.DataFrame:
-    obs = obs.sort_values(["road_segment_id", "event_time"]).copy()
-    obs["surface_temp_trend_1h"] = obs.groupby("road_segment_id")["surface_temp_c"].diff(6).fillna(0.0)
+    obs = add_surface_temp_trend_1h(obs)
     obs = obs.merge(segments[["road_segment_id", "exposure_factor"]], on="road_segment_id", how="left")
     return obs
 
@@ -25,11 +35,19 @@ def _add_features(obs: pd.DataFrame, segments: pd.DataFrame) -> pd.DataFrame:
 def train() -> None:
     import os
 
-    if not os.path.exists(f"{ARTIFACTS}/observations.csv"):
-        generate_data()
+    segments = make_segments()
+    obs = make_observations(segments)
 
-    segments = pd.read_csv(f"{ARTIFACTS}/segments.csv")
-    obs = pd.read_csv(f"{ARTIFACTS}/observations.csv", parse_dates=["event_time"])
+    # Fresh checkout convenience: give the dashboard something to serve without
+    # a separate step. Never overwrites existing serving data — real data staged
+    # by build_dataset.py/build_live_weather.py is left alone.
+    if not os.path.exists(f"{ARTIFACTS}/segments.csv"):
+        from prototype.provenance import write_meta
+
+        segments.to_csv(f"{ARTIFACTS}/segments.csv", index=False)
+        obs.to_csv(f"{ARTIFACTS}/observations.csv", index=False)
+        write_meta(segments_source="synthetic", observations_source="synthetic")
+
     obs = _add_features(obs, segments)
 
     x = torch.tensor(obs[FEATURE_COLUMNS].values, dtype=torch.float32)

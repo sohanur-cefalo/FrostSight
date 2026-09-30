@@ -98,10 +98,13 @@ def make_observations(segments: pd.DataFrame) -> pd.DataFrame:
 
 
 def main() -> None:
+    from prototype.provenance import write_meta
+
     segments = make_segments()
     observations = make_observations(segments)
     segments.to_csv("prototype/artifacts/segments.csv", index=False)
     observations.to_csv("prototype/artifacts/observations.csv", index=False)
+    write_meta(segments_source="synthetic", observations_source="synthetic")
     print(f"Wrote {len(segments)} segments and {len(observations)} observations to prototype/artifacts/")
 
 

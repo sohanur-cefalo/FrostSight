@@ -5,18 +5,27 @@ from __future__ import annotations
 import pandas as pd
 import torch
 
+from prototype.features import add_surface_temp_trend_1h
 from prototype.model import FEATURE_COLUMNS, IcingRiskNet, risk_level
 
 ARTIFACTS = "prototype/artifacts"
 
 
 def _latest_observations(obs: pd.DataFrame) -> pd.DataFrame:
-    obs = obs.sort_values(["road_segment_id", "event_time"])
-    latest = obs.groupby("road_segment_id").tail(1).copy()
-    trend = obs.groupby("road_segment_id")["surface_temp_c"].diff(6)
-    obs = obs.assign(surface_temp_trend_1h=trend.fillna(0.0))
-    latest = obs.groupby("road_segment_id").tail(1).copy()
-    return latest
+    """The "current condition" row per segment. For past-observation data
+    (generate_data.py's synthetic history) that's the max event_time; for a
+    forward-looking forecast series (build_live_weather.py, Phase 2) the max
+    event_time is the *furthest future* point, not "now" — so pick whichever
+    row's event_time is closest to the current wall-clock time instead, which
+    is correct for both."""
+    obs = add_surface_temp_trend_1h(obs)
+    now = pd.Timestamp.now(tz="UTC")
+    event_time = obs["event_time"]
+    if event_time.dt.tz is None:
+        event_time = event_time.dt.tz_localize("UTC")
+    obs = obs.assign(_distance_from_now=(event_time - now).abs())
+    closest_idx = obs.groupby("road_segment_id")["_distance_from_now"].idxmin()
+    return obs.loc[closest_idx].drop(columns="_distance_from_now").copy()
 
 
 def score_segments() -> pd.DataFrame:

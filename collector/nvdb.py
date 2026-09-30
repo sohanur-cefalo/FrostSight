@@ -16,6 +16,8 @@ source (elevation.py, Open-Meteo fallback per ADR-0006).
 from __future__ import annotations
 
 import logging
+import math
+import re
 from collections.abc import Iterator
 from typing import Any
 
@@ -26,7 +28,11 @@ log = logging.getLogger("collector.nvdb")
 
 BASE = "https://nvdbapiles.atlas.vegvesen.no"
 STATION_OBJECT_TYPE = 153
+ROAD_LINK_ENDPOINT = f"{BASE}/vegnett/veglenkesekvenser/segmentert"
 PAGE_SIZE = 1000
+# Pedestrian/bike infrastructure shares the road network dataset; we only want
+# real driving road criticality, so these typeVeg values are dropped.
+_NON_ROAD_TYPES = ("sykkel", "gang")
 
 # UTM 33N (EPSG:25833, same X/Y as NVDB's default EPSG:5973) -> WGS84 lon/lat.
 _TO_WGS84 = Transformer.from_crs("EPSG:25833", "EPSG:4326", always_xy=True)
@@ -104,6 +110,88 @@ def fetch_stations(county: int = 55, session: requests.Session | None = None) ->
         )
     log.info("fetched %d NVDB road-weather stations for county %s", len(stations), county)
     return stations
+
+
+def _route_filter(route_code: str) -> str | None:
+    """"E6" -> "EV6", "F866" -> "FV866": NVDB's vegsystemreferanse filter format is
+    <vegkategori><fase><nummer>, and "V" (Vedtatt/normal) is what real numbered
+    public routes use. Returns None for a code we can't parse (e.g. "unnamed")."""
+    m = re.match(r"^([A-Za-z]+)(\d+)$", route_code)
+    if not m:
+        return None
+    category, number = m.groups()
+    return f"{category.upper()}V{number}"
+
+
+def _parse_linestring_wkt(wkt: str) -> list[tuple[float, float]]:
+    """"LINESTRING Z (x y z, x y z, ...)" or "LINESTRING (x y, ...)" -> [(x, y), ...]
+    in the source CRS, dropping any Z."""
+    inner = wkt.split("(", 1)[1].rstrip(")")
+    points = []
+    for part in inner.split(","):
+        x_str, y_str, *_ = part.split()
+        points.append((float(x_str), float(y_str)))
+    return points
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def fetch_road_links_near_stations(
+    stations: list[dict[str, Any]],
+    county: int = 55,
+    max_distance_km: float = 12.0,
+    session: requests.Session | None = None,
+) -> list[dict[str, Any]]:
+    """Real road-network geometry (LineStrings) for the routes our stations sit
+    on, kept to links within max_distance_km of at least one station — demo
+    scope (docs/adr/0006-real-data-integration.md Phase 1b), not a full county
+    or national road network. At national scale (post-MVP), this per-station
+    radius filter is dropped and every county's road network is loaded, likely
+    served as vector tiles rather than embedded line geometry client-side.
+    """
+    session = session or nvdb_session()
+    route_codes = {c for s in stations if (c := _route_filter(s["road_name"]))}
+    log.info("fetching road links for routes: %s", sorted(route_codes))
+
+    links: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    for route in route_codes:
+        params = {"fylke": county, "vegsystemreferanse": route, "antall": PAGE_SIZE}
+        for obj in _iter_pages(session, ROAD_LINK_ENDPOINT, params):
+            if obj["veglenkesekvensid"] in seen_ids:
+                continue
+            type_veg = (obj.get("typeVeg") or "").lower()
+            if any(t in type_veg for t in _NON_ROAD_TYPES):
+                continue
+            geometri = obj.get("geometri")
+            if not geometri or not geometri["wkt"].upper().startswith("LINESTRING"):
+                continue
+
+            xy_points = _parse_linestring_wkt(geometri["wkt"])
+            coords = [_TO_WGS84.transform(x, y) for x, y in xy_points]  # (lon, lat) per point
+            mid_lon, mid_lat = coords[len(coords) // 2]
+            if not any(
+                _haversine_km(mid_lat, mid_lon, s["lat"], s["lon"]) <= max_distance_km for s in stations
+            ):
+                continue
+
+            seen_ids.add(obj["veglenkesekvensid"])
+            links.append(
+                {
+                    "veglenkesekvensid": obj["veglenkesekvensid"],
+                    "route_code": route,
+                    "coords": [{"lon": lon, "lat": lat} for lon, lat in coords],
+                }
+            )
+    log.info("kept %d road links within %gkm of a station", len(links), max_distance_km)
+    return links
 
 
 def main() -> None:

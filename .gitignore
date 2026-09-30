@@ -12,8 +12,10 @@ dist/
 htmlcov/
 
 # Prototype: generated data + trained model, regenerate with `python -m prototype.train`
+# (and, for real data, build_dataset.py / build_road_network.py / build_live_weather.py)
 prototype/artifacts/*.csv
 prototype/artifacts/*.pt
+prototype/artifacts/*.json
 
 # Databricks
 .databricks/
