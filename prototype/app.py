@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from dash import Dash, Input, Output, dash_table, dcc, html
@@ -34,21 +35,36 @@ route_df = df.sort_values("road_segment_id").reset_index(drop=True)
 
 MAP_ASPECT = 2.1  # width:height target so the full-screen map reads as a landscape panel
 
+# Longitudinal degree span covered by one Mapbox/OSM tile row at each integer zoom
+# level (0=world ... 20=building). Same table wsd-dashboard's wirescan.geometry.zoom_center
+# uses to turn a lon/lat bounding box into a zoom level for Scattermapbox.
+_ZOOM_LON_SPANS = [
+    360, 180, 90, 45, 22.5, 11.25, 5.625, 2.813, 1.406, 0.703,
+    0.352, 0.176, 0.088, 0.044, 0.022, 0.011, 0.005, 0.003, 0.001, 0.0007, 0.0003,
+]
 
-def _wide_map_bounds() -> tuple[list[float], list[float]]:
-    """Lon/lat range padded so the map fills a wide panel with real surrounding
-    coastline instead of a narrow strip hugging just the road corridor."""
-    lat_min, lat_max = route_df["lat"].min(), route_df["lat"].max()
-    lon_min, lon_max = route_df["lon"].min(), route_df["lon"].max()
-    lat_span = (lat_max - lat_min) * 1.3
+
+def _zoom_center(lons, lats) -> tuple[float, dict[str, float]]:
+    """Fit a Mapbox zoom level + center to a set of coordinates, padded so the
+    road reads as a landscape panel rather than a narrow strip. This is the
+    Scattermapbox analogue of wsd-dashboard's plot_cables() -> zoom_center()."""
+    lat_min, lat_max = min(lats), max(lats)
+    lon_min, lon_max = min(lons), max(lons)
+    # Tighter padding (was 1.3x) so the corridor fills the panel instead of
+    # leaving a wide margin of unrelated coastline around it.
+    lat_span = max((lat_max - lat_min) * 1.08, 0.01)
     lat_mid = (lat_max + lat_min) / 2
     lon_span_needed = MAP_ASPECT * lat_span / math.cos(math.radians(lat_mid))
-    lon_span = max((lon_max - lon_min) * 1.3, lon_span_needed)
+    lon_span = max((lon_max - lon_min) * 1.08, lon_span_needed, 0.01)
     lon_mid = (lon_max + lon_min) / 2
-    return (
-        [lon_mid - lon_span / 2, lon_mid + lon_span / 2],
-        [lat_mid - lat_span / 2, lat_mid + lat_span / 2],
-    )
+
+    zoom_levels = list(range(len(_ZOOM_LON_SPANS)))
+    lon_zoom = np.interp(lon_span, _ZOOM_LON_SPANS[::-1], zoom_levels[::-1])
+    lat_zoom = np.interp(lat_span / MAP_ASPECT, _ZOOM_LON_SPANS[::-1], zoom_levels[::-1])
+    # +0.5 extra zoom-in on top of the strict best fit, since the best-fit level
+    # rounds down and reads as noticeably too wide/zoomed-out otherwise.
+    zoom = round(min(lon_zoom, lat_zoom) + 0.5, 2)
+    return zoom, {"lon": lon_mid, "lat": lat_mid}
 
 app = Dash(__name__)
 app.title = "FrostSight prototype"
@@ -124,68 +140,117 @@ topbar = html.Div(
 )
 
 
-def build_map_figure(vehicle_step: int | None = None) -> go.Figure:
-    """Norway/Troms basemap (Plotly's bundled coastline vectors, no tile server needed),
-    the pilot-county road drawn as a path coloured per segment by risk, and an optional
-    simulated gritting-truck position moving along that path in real time.
-    """
-    fig = go.Figure()
+def load_route_df() -> pd.DataFrame:
+    """Re-run the risk model over the current observation data and rebuild the
+    ordered road path. Called once at startup and again on every map reload,
+    the way wsd-dashboard's overview re-fetches cables/geometries on each
+    on-load interval / refresh click instead of caching a stale figure."""
+    fresh_df = score_segments()
+    return fresh_df.sort_values("road_segment_id").reset_index(drop=True)
 
-    # Road path: one line trace per segment-to-segment hop, coloured by that hop's risk,
-    # so the whole corridor reads like the priority list laid over the map.
-    for i in range(len(route_df) - 1):
-        a, b = route_df.iloc[i], route_df.iloc[i + 1]
-        fig.add_trace(
-            go.Scattergeo(
-                lon=[a["lon"], b["lon"]],
-                lat=[a["lat"], b["lat"]],
-                mode="lines",
-                line={"width": 5, "color": RISK_COLORS[a["risk_level"]]},
-                hoverinfo="skip",
-                showlegend=False,
+
+class RoadMapView:
+    """Builds the Troms road map figure trace-by-trace, mirroring wsd-dashboard's
+    MapView: each plot_* call appends Scattermapbox trace(s) on real map tiles
+    (no Mapbox token required — the free "open-street-map" style, same idea as
+    wsd's mapbox-styled Scattermapbox) and accumulates the lon/lat extent, then
+    fit_bounds() zooms/centers the basemap to what was actually plotted instead
+    of a hardcoded viewport."""
+
+    def __init__(self) -> None:
+        self.fig = go.Figure()
+        self.all_lons: list[float] = []
+        self.all_lats: list[float] = []
+
+    def _track_extent(self, lons, lats) -> None:
+        self.all_lons.extend(lons)
+        self.all_lats.extend(lats)
+
+    # A same-route hop longer than this is almost certainly two separate, far-apart
+    # stretches of the same numbered road (e.g. E6 near Tromsø vs. E6 100 km south),
+    # not a real adjacent connection — skip drawing a line for it.
+    _MAX_HOP_KM = 15.0
+
+    @staticmethod
+    def _haversine_km(lat1, lon1, lat2, lon2) -> float:
+        r = 6371.0
+        p1, p2 = math.radians(lat1), math.radians(lat2)
+        dp = math.radians(lat2 - lat1)
+        dl = math.radians(lon2 - lon1)
+        a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+        return 2 * r * math.asin(math.sqrt(a))
+
+    def plot_roads(self, route_df: pd.DataFrame) -> None:
+        """One line trace per segment-to-segment hop, coloured by that hop's risk —
+        the road-network analogue of MapView.plot_cables(). Real stations
+        (docs/adr/0006-real-data-integration.md Phase 1) sit on different physical
+        roads and even the same numbered route can jump between far-apart stretches,
+        so a hop is only drawn when both ends share the same route_code AND are
+        within _MAX_HOP_KM of each other — otherwise it would fake a road connection
+        that doesn't exist. Segments without a route_code (older synthetic data)
+        always connect, matching the original single-corridor behaviour."""
+        has_route_code = "route_code" in route_df.columns
+        for i in range(len(route_df) - 1):
+            a, b = route_df.iloc[i], route_df.iloc[i + 1]
+            if has_route_code:
+                same_route = a["route_code"] == b["route_code"]
+                close_enough = self._haversine_km(a["lat"], a["lon"], b["lat"], b["lon"]) <= self._MAX_HOP_KM
+                if not (same_route and close_enough):
+                    continue
+            self.fig.add_trace(
+                go.Scattermap(
+                    lon=[a["lon"], b["lon"]],
+                    lat=[a["lat"], b["lat"]],
+                    mode="lines",
+                    line={"width": 5, "color": RISK_COLORS[a["risk_level"]]},
+                    hoverinfo="skip",
+                    showlegend=False,
+                )
             )
-        )
+        self._track_extent(route_df["lon"], route_df["lat"])
 
-    # Traveled portion of the route so far, drawn as a thick outline on top of the path.
-    if vehicle_step:
+    def plot_traveled(self, route_df: pd.DataFrame, vehicle_step: int) -> None:
+        """Thick dotted outline over the portion of the route already covered."""
+        if not vehicle_step:
+            return
         traveled = route_df.iloc[: vehicle_step + 1]
-        fig.add_trace(
-            go.Scattergeo(
+        self.fig.add_trace(
+            go.Scattermap(
                 lon=traveled["lon"],
                 lat=traveled["lat"],
                 mode="lines",
-                line={"width": 2, "color": "#12233a", "dash": "dot"},
+                line={"width": 3, "color": "#12233a"},
                 hoverinfo="skip",
                 showlegend=False,
             )
         )
 
-    fig.add_trace(
-        go.Scattergeo(
-            lon=route_df["lon"],
-            lat=route_df["lat"],
-            mode="markers",
-            marker={
-                "size": 11,
-                "color": [RISK_COLORS[lvl] for lvl in route_df["risk_level"]],
-                "line": {"width": 1, "color": "white"},
-            },
-            text=route_df["road_segment_id"] + " — " + route_df["risk_level"],
-            customdata=route_df["ml_risk_score"],
-            hovertemplate="%{text}<br>score=%{customdata:.2f}<extra></extra>",
-            name="Segments",
-            showlegend=False,
+    def plot_segment_markers(self, route_df: pd.DataFrame) -> None:
+        self.fig.add_trace(
+            go.Scattermap(
+                lon=route_df["lon"],
+                lat=route_df["lat"],
+                mode="markers",
+                marker={
+                    "size": 11,
+                    "color": [RISK_COLORS[lvl] for lvl in route_df["risk_level"]],
+                },
+                text=route_df["road_segment_id"] + " — " + route_df["risk_level"],
+                customdata=route_df["ml_risk_score"],
+                hovertemplate="%{text}<br>score=%{customdata:.2f}<extra></extra>",
+                name="Segments",
+                showlegend=False,
+            )
         )
-    )
 
-    if vehicle_step is not None:
+    def plot_vehicle(self, route_df: pd.DataFrame, vehicle_step: int) -> None:
         pos = route_df.iloc[vehicle_step % len(route_df)]
-        fig.add_trace(
-            go.Scattergeo(
+        self.fig.add_trace(
+            go.Scattermap(
                 lon=[pos["lon"]],
                 lat=[pos["lat"]],
                 mode="markers",
-                marker={"size": 18, "color": "#1565C0", "symbol": "triangle-up", "line": {"width": 2, "color": "white"}},
+                marker={"size": 16, "color": "#1565C0"},
                 text=[f"Gritting unit — near {pos['road_segment_id']}"],
                 hovertemplate="%{text}<extra></extra>",
                 name="Gritting unit (simulated GPS)",
@@ -193,43 +258,47 @@ def build_map_figure(vehicle_step: int | None = None) -> go.Figure:
             )
         )
 
-    # Inline condition callouts on the worst segments, the way operational road-weather
-    # products label map regions directly ("Ice", "-4.8°C") instead of a side legend.
-    worst = route_df.sort_values("ml_risk_score", ascending=False).head(3)
-    fig.add_trace(
-        go.Scattergeo(
-            lon=worst["lon"],
-            lat=worst["lat"],
-            mode="text",
-            text=[f"{r.risk_level} · {r.surface_temp_c:.1f}°C" for r in worst.itertuples()],
-            textfont={"size": 12, "color": "#12233a", "family": "IBM Plex Sans, Arial"},
-            textposition="top center",
-            hoverinfo="skip",
-            showlegend=False,
+    def plot_condition_labels(self, route_df: pd.DataFrame, top_n: int = 3) -> None:
+        """Inline condition callouts on the worst segments, the way operational
+        road-weather products label map regions directly instead of a side legend."""
+        worst = route_df.sort_values("ml_risk_score", ascending=False).head(top_n)
+        self.fig.add_trace(
+            go.Scattermap(
+                lon=worst["lon"],
+                lat=worst["lat"],
+                mode="text",
+                text=[f"{r.risk_level} · {r.surface_temp_c:.1f}°C" for r in worst.itertuples()],
+                textfont={"size": 12, "color": "#12233a", "family": "IBM Plex Sans, Arial"},
+                textposition="top right",
+                hoverinfo="skip",
+                showlegend=False,
+            )
         )
-    )
 
-    lon_range, lat_range = _wide_map_bounds()
-    fig.update_geos(
-        scope="europe",
-        resolution=50,
-        projection_type="mercator",
-        lonaxis_range=lon_range,
-        lataxis_range=lat_range,
-        showland=True,
-        landcolor="#eef2f6",
-        showocean=True,
-        oceancolor="#dbe7f2",
-        showlakes=True,
-        lakecolor="#dbe7f2",
-        showcountries=True,
-        countrycolor="#9aa5b1",
-        showsubunits=True,
-        subunitcolor="#c3ccd6",
-        showframe=False,
-    )
-    fig.update_layout(margin={"l": 0, "r": 0, "t": 0, "b": 0}, autosize=True)
-    return fig
+    def fit_bounds(self) -> None:
+        zoom, center = _zoom_center(self.all_lons, self.all_lats)
+        self.fig.update_layout(
+            map={"style": "open-street-map", "zoom": zoom, "center": center},
+            margin={"l": 0, "r": 0, "t": 0, "b": 0},
+            autosize=True,
+        )
+
+
+def build_map_figure(route_df: pd.DataFrame, vehicle_step: int | None = None) -> go.Figure:
+    """Real OpenStreetMap tiles (Scattermapbox, no Mapbox token needed), the
+    pilot-county road drawn as a path coloured per segment by risk, and an
+    optional simulated gritting-truck position moving along that path in
+    real time — the same rendering approach as wsd-dashboard's cable map.
+    """
+    map_view = RoadMapView()
+    map_view.plot_roads(route_df)
+    map_view.plot_traveled(route_df, vehicle_step or 0)
+    map_view.plot_segment_markers(route_df)
+    if vehicle_step is not None:
+        map_view.plot_vehicle(route_df, vehicle_step)
+    map_view.plot_condition_labels(route_df)
+    map_view.fit_bounds()
+    return map_view.fig
 
 
 def _stat_tile(label: str, value: str, accent: str = "#1565C0"):
@@ -326,12 +395,54 @@ def risk_map_tab():
             ),
             legend,
             html.Div(
-                dcc.Graph(
-                    id="risk-map-graph",
-                    figure=build_map_figure(0),
-                    config={"displayModeBar": False, "responsive": True},
-                    style={"height": "78vh", "width": "100%"},
-                ),
+                [
+                    html.Div(
+                        [
+                            html.Span(
+                                "MAP",
+                                style={
+                                    "fontSize": "12px",
+                                    "fontWeight": "700",
+                                    "letterSpacing": "0.6px",
+                                    "color": "#6a7179",
+                                    "textTransform": "uppercase",
+                                },
+                            ),
+                            html.Button(
+                                "⟳ Refresh",
+                                id="map-refresh-button",
+                                n_clicks=0,
+                                style={
+                                    "border": "1px solid #d8dee6",
+                                    "borderRadius": "6px",
+                                    "background": "white",
+                                    "color": NAVY,
+                                    "fontSize": "12px",
+                                    "fontWeight": "600",
+                                    "padding": "4px 10px",
+                                    "cursor": "pointer",
+                                },
+                            ),
+                        ],
+                        style={
+                            "display": "flex",
+                            "justifyContent": "space-between",
+                            "alignItems": "center",
+                            "marginBottom": "8px",
+                        },
+                    ),
+                    dcc.Loading(
+                        id="risk-map-loading",
+                        type="circle",
+                        color=NAVY,
+                        children=dcc.Graph(
+                            id="risk-map-graph",
+                            figure=build_map_figure(route_df, 0),
+                            config={"displayModeBar": False, "responsive": True},
+                            style={"height": "78vh", "width": "100%"},
+                        ),
+                    ),
+                ],
                 style={
                     "background": "#fbfcfd",
                     "border": "1px solid #d8dee6",
@@ -339,9 +450,26 @@ def risk_map_tab():
                     "padding": "8px",
                 },
             ),
+            # Reloads road data from source on a schedule, the way wsd-dashboard's
+            # overview-on-load-interval re-fetches cables/geometries hourly.
+            dcc.Interval(id="map-reload-interval", interval=1000 * 3600, n_intervals=0),
             dcc.Interval(id="vehicle-interval", interval=2000, n_intervals=0),
         ]
     )
+
+
+@app.callback(
+    Output("risk-map-graph", "figure", allow_duplicate=True),
+    Input("map-reload-interval", "n_intervals"),
+    Input("map-refresh-button", "n_clicks"),
+    prevent_initial_call=True,
+)
+def on_map_reload(_n_intervals, _n_clicks):
+    """Re-fetch/re-score road data and rebuild the map — the road-map analogue
+    of wsd-dashboard's on_page_load_interval / on_overview_map_refresh_button_click."""
+    global route_df
+    route_df = load_route_df()
+    return build_map_figure(route_df, 0)
 
 
 @app.callback(
@@ -349,7 +477,7 @@ def risk_map_tab():
     Input("vehicle-interval", "n_intervals"),
 )
 def update_vehicle_position(n_intervals: int):
-    return build_map_figure(n_intervals % len(route_df))
+    return build_map_figure(route_df, n_intervals % len(route_df))
 
 
 def road_detail_tab():

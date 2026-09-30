@@ -34,6 +34,7 @@ def make_segments() -> pd.DataFrame:
         {
             "road_segment_id": [f"55-{i:03d}" for i in range(N_SEGMENTS)],
             "road_name": [f"E8/{i:03d}" for i in range(N_SEGMENTS)],
+            "route_code": "E8",  # single synthetic corridor; consecutive segments always connect
             "lat": lat,
             "lon": lon,
             "elevation_m": elevation.round(1),
