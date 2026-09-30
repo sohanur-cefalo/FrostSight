@@ -54,7 +54,8 @@ def make_real_segments(county: int = PILOT_COUNTY) -> pd.DataFrame:
 
     segments["road_segment_id"] = [f"{county}-{i:03d}" for i in range(len(segments))]
     segments["route_code"] = segments["road_name"]  # e.g. "E6", for grouping same-road hops on the map
-    segments["road_name"] = segments["road_name"] + " · " + segments["name"]
+    segments["road_name"] = segments["name"]  # the place name only (e.g. "Arnøya"), not "F7940 · Arnøya" —
+    # route_code already carries the route, so the hover/UI shouldn't repeat it inside road_name too.
 
     return segments[
         ["road_segment_id", "road_name", "route_code", "lat", "lon", "elevation_m", "exposure_factor"]

@@ -16,6 +16,7 @@ import os
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import dash
 from dash import Dash, Input, Output, dash_table, dcc, html
 
 from prototype.provenance import describe_sources
@@ -40,6 +41,20 @@ RISK_COLORS = {
     "VERY_HIGH": "#C1272D", # critical
 }
 RISK_ORDER = ["LOW", "MEDIUM", "HIGH", "VERY_HIGH"]
+RISK_LABELS = {"LOW": "Low", "MEDIUM": "Medium", "HIGH": "High", "VERY_HIGH": "Very high"}
+
+
+def humanize_risk(risk_level: str) -> str:
+    return RISK_LABELS.get(risk_level, risk_level.title())
+
+
+def humanize_route_code(route_code: str) -> str:
+    """"EV6" -> "E6", "FV863" -> "Fv863", "RV83" -> "Rv83": the road-sign
+    convention drivers actually see in Norway (and how Google Maps labels
+    these roads), instead of the raw NVDB filter string."""
+    if route_code.upper().startswith("E"):
+        return route_code[0].upper() + route_code[2:]  # drop the "V", keep "E6"
+    return route_code[0].upper() + "v" + route_code[2:]
 
 df = score_segments()
 obs = pd.read_csv("prototype/artifacts/observations.csv", parse_dates=["event_time"])
@@ -199,7 +214,7 @@ class RoadMapView:
         a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
         return 2 * r * math.asin(math.sqrt(a))
 
-    def plot_roads(self, route_df: pd.DataFrame) -> None:
+    def plot_roads(self, route_df: pd.DataFrame, focus_id: str | None = None) -> None:
         """One line trace per segment-to-segment hop, coloured by that hop's risk —
         the road-network analogue of MapView.plot_cables(). Real stations
         (docs/adr/0006-real-data-integration.md Phase 1) sit on different physical
@@ -207,10 +222,16 @@ class RoadMapView:
         so a hop is only drawn when both ends share the same route_code AND are
         within _MAX_HOP_KM of each other — otherwise it would fake a road connection
         that doesn't exist. Segments without a route_code (older synthetic data)
-        always connect, matching the original single-corridor behaviour."""
+        always connect, matching the original single-corridor behaviour.
+
+        When focus_id is set, only hops touching that segment are drawn — the
+        "show this point's connecting roads only" click-to-focus view — and the
+        map extent tracks just those hops instead of the whole route."""
         has_route_code = "route_code" in route_df.columns
         for i in range(len(route_df) - 1):
             a, b = route_df.iloc[i], route_df.iloc[i + 1]
+            if focus_id is not None and focus_id not in (a["road_segment_id"], b["road_segment_id"]):
+                continue
             if has_route_code:
                 same_route = a["route_code"] == b["route_code"]
                 close_enough = self._haversine_km(a["lat"], a["lon"], b["lat"], b["lon"]) <= self._MAX_HOP_KM
@@ -226,32 +247,55 @@ class RoadMapView:
                     showlegend=False,
                 )
             )
-        self._track_extent(route_df["lon"], route_df["lat"])
+            if focus_id is not None:
+                self._track_extent([a["lon"], b["lon"]], [a["lat"], b["lat"]])
+        if focus_id is None:
+            self._track_extent(route_df["lon"], route_df["lat"])
 
-    def plot_road_network(self, road_links: list[dict], route_df: pd.DataFrame) -> None:
+    def plot_road_network(
+        self, road_links: list[dict], route_df: pd.DataFrame, focus_id: str | None = None
+    ) -> None:
         """Real road-link geometry (prototype/build_road_network.py, Phase 1b),
         each link colored by its nearest real weather station's current risk
         level — since we only have weather readings at 30 points, not
         continuously along the road. One trace per risk level (not per link):
         Plotly draws many disconnected line segments in a single Scattermap
         trace by separating them with a `None` coordinate, which keeps this to
-        4 traces instead of one per link (hundreds), for render performance."""
+        4 traces instead of one per link (hundreds), for render performance.
+
+        When focus_id is set, only links whose nearest station is that segment
+        are kept — the click-to-focus "connecting roads only" view — and only
+        those links contribute to the map extent, so fit_bounds() zooms in on
+        just that station's roads."""
         station_lats = route_df["lat"].to_numpy()
         station_lons = route_df["lon"].to_numpy()
-        station_risk = route_df["risk_level"].to_numpy()
 
-        by_risk: dict[str, dict[str, list]] = {lvl: {"lon": [], "lat": []} for lvl in RISK_ORDER}
+        by_risk: dict[str, dict[str, list]] = {lvl: {"lon": [], "lat": [], "text": []} for lvl in RISK_ORDER}
         for link in road_links:
             coords = link["coords"]
             mid = coords[len(coords) // 2]
             distances = self._haversine_vec(mid["lat"], mid["lon"], station_lats, station_lons)
-            nearest_risk = station_risk[distances.argmin()]
+            nearest_idx = distances.argmin()
+            nearest = route_df.iloc[nearest_idx]
+            nearest_risk = nearest["risk_level"]
+
+            if focus_id is not None and nearest["road_segment_id"] != focus_id:
+                continue
+
+            hover_text = (
+                f"<b>{humanize_route_code(link['route_code'])}</b><br>"
+                f"Risk: {humanize_risk(nearest_risk)}<br>"
+                f"Conditions: {nearest['drivers']}<br>"
+                f"Nearest sensor: {nearest['road_name']} ({distances[nearest_idx]:.1f} km away)"
+            )
 
             bucket = by_risk[nearest_risk]
             bucket["lon"].extend(c["lon"] for c in coords)
             bucket["lat"].extend(c["lat"] for c in coords)
+            bucket["text"].extend([hover_text] * len(coords))
             bucket["lon"].append(None)  # break so consecutive links don't connect
             bucket["lat"].append(None)
+            bucket["text"].append(None)
             self._track_extent([c["lon"] for c in coords], [c["lat"] for c in coords])
 
         for risk_level in RISK_ORDER:
@@ -265,7 +309,8 @@ class RoadMapView:
                     mode="lines",
                     line={"width": 6, "color": RISK_COLORS[risk_level]},
                     name=risk_level,
-                    hoverinfo="skip",
+                    text=bucket["text"],
+                    hoverinfo="text",
                     showlegend=False,
                 )
             )
@@ -295,23 +340,44 @@ class RoadMapView:
             )
         )
 
-    def plot_segment_markers(self, route_df: pd.DataFrame) -> None:
+    def plot_segment_markers(self, route_df: pd.DataFrame, focus_id: str | None = None) -> None:
+        """All station markers, clickable to focus (customdata carries the segment
+        id so the click callback can identify it regardless of hover text). When
+        focus_id is set, only that one station's marker is drawn, enlarged, so the
+        focused view reads as "this point" rather than the full station list."""
+        plotted = route_df if focus_id is None else route_df[route_df["road_segment_id"] == focus_id]
+        hover_text = [
+            f"<b>{row.road_name}</b><br>"
+            f"Station {row.road_segment_id}<br>"
+            f"Risk: {humanize_risk(row.risk_level)}<br>"
+            f"Conditions: {row.drivers}"
+            for row in plotted.itertuples()
+        ]
+        # open-street-map's raster base style has no Mapbox sprite atlas, so
+        # Scattermap marker.symbol icons (pins, road signs, etc.) silently
+        # don't render on it, and a second overlaid marker trace to fake a
+        # halo/ring intermittently breaks the underlying maplibre map on the
+        # 2s vehicle-interval full-figure rebuild (duplicate-layer errors) —
+        # so the reliable "point vs. road line" distinction on this base style
+        # is size/color contrast on a single circle marker, not an icon or ring.
         self.fig.add_trace(
             go.Scattermap(
-                lon=route_df["lon"],
-                lat=route_df["lat"],
+                lon=plotted["lon"],
+                lat=plotted["lat"],
                 mode="markers",
                 marker={
-                    "size": 11,
-                    "color": [RISK_COLORS[lvl] for lvl in route_df["risk_level"]],
+                    "size": 20 if focus_id is not None else 13,
+                    "color": [RISK_COLORS[lvl] for lvl in plotted["risk_level"]],
                 },
-                text=route_df["road_segment_id"] + " — " + route_df["risk_level"],
-                customdata=route_df["ml_risk_score"],
-                hovertemplate="%{text}<br>score=%{customdata:.2f}<extra></extra>",
+                text=hover_text,
+                customdata=plotted["road_segment_id"],
+                hoverinfo="text",
                 name="Segments",
                 showlegend=False,
             )
         )
+        if focus_id is not None:
+            self._track_extent(plotted["lon"], plotted["lat"])
 
     def plot_vehicle(self, route_df: pd.DataFrame, vehicle_step: int) -> None:
         pos = route_df.iloc[vehicle_step % len(route_df)]
@@ -345,8 +411,13 @@ class RoadMapView:
             )
         )
 
-    def fit_bounds(self) -> None:
+    def fit_bounds(self, tight: bool = False) -> None:
         zoom, center = _zoom_center(self.all_lons, self.all_lats)
+        if tight:
+            # A focused single station with short/no connecting links can fit a
+            # wide bounding box at the default padding; floor the zoom so the
+            # focus view always reads as "zoomed in on this point", not the region.
+            zoom = max(zoom, 13.0)
         self.fig.update_layout(
             map={"style": "open-street-map", "zoom": zoom, "center": center},
             margin={"l": 0, "r": 0, "t": 0, "b": 0},
@@ -355,7 +426,10 @@ class RoadMapView:
 
 
 def build_map_figure(
-    route_df: pd.DataFrame, vehicle_step: int | None = None, road_links: list[dict] | None = None
+    route_df: pd.DataFrame,
+    vehicle_step: int | None = None,
+    road_links: list[dict] | None = None,
+    focus_id: str | None = None,
 ) -> go.Figure:
     """Real OpenStreetMap tiles (Scattermap, no Mapbox token needed), the
     pilot-county road network drawn as real link geometry colored by the
@@ -363,18 +437,26 @@ def build_map_figure(
     coarser station-to-station connector lines (Phase 1), and an optional
     simulated gritting-truck position moving along the route in real time —
     the same rendering approach as wsd-dashboard's cable map.
+
+    focus_id, when set, switches the map into the click-to-focus view: only
+    the clicked station's marker and its connecting roads are drawn, and the
+    map zooms/centers on just that extent instead of the whole route. The
+    moving vehicle and top-risk callouts belong to the whole-route view, so
+    they're skipped while focused.
     """
     map_view = RoadMapView()
     if road_links:
-        map_view.plot_road_network(road_links, route_df)
+        map_view.plot_road_network(road_links, route_df, focus_id=focus_id)
     else:
-        map_view.plot_roads(route_df)
-    map_view.plot_traveled(route_df, vehicle_step or 0)
-    map_view.plot_segment_markers(route_df)
-    if vehicle_step is not None:
-        map_view.plot_vehicle(route_df, vehicle_step)
-    map_view.plot_condition_labels(route_df)
-    map_view.fit_bounds()
+        map_view.plot_roads(route_df, focus_id=focus_id)
+    if focus_id is None:
+        map_view.plot_traveled(route_df, vehicle_step or 0)
+    map_view.plot_segment_markers(route_df, focus_id=focus_id)
+    if focus_id is None:
+        if vehicle_step is not None:
+            map_view.plot_vehicle(route_df, vehicle_step)
+        map_view.plot_condition_labels(route_df)
+    map_view.fit_bounds(tight=focus_id is not None)
     return map_view.fig
 
 
@@ -523,7 +605,16 @@ def risk_map_tab():
                         children=dcc.Graph(
                             id="risk-map-graph",
                             figure=build_map_figure(route_df, 0, road_links),
-                            config={"displayModeBar": False, "responsive": True, "scrollZoom": True},
+                            # doubleClick off: Plotly's own dblclick resets the
+                            # view instead of reaching our marker, since a
+                            # dblclick on a marker still fires it after two
+                            # plotly_click events.
+                            config={
+                                "displayModeBar": False,
+                                "responsive": True,
+                                "scrollZoom": True,
+                                "doubleClick": False,
+                            },
                             style={"height": "78vh", "width": "100%"},
                         ),
                     ),
@@ -539,31 +630,101 @@ def risk_map_tab():
             # overview-on-load-interval re-fetches cables/geometries hourly.
             dcc.Interval(id="map-reload-interval", interval=1000 * 3600, n_intervals=0),
             dcc.Interval(id="vehicle-interval", interval=2000, n_intervals=0),
+            # Fires once on page load so the clientside callback below can bind
+            # a double-click listener onto the graph's underlying plotly div.
+            dcc.Interval(id="attach-dblclick-listener", interval=200, max_intervals=25),
+            # Which station (if any) is click-focused. Double-click a marker to
+            # set it, double-click it again (or Refresh) to clear it.
+            dcc.Store(id="focus-segment", data=None),
         ]
     )
 
 
+# Plotly emits `plotly_click` twice for a double-click, with no distinct
+# per-marker dblclick event of its own (`plotly_doubleclick` fires but carries
+# no point/customdata) — so double-click-to-focus is detected here in JS by
+# timing two plotly_click events on the same marker, then written straight to
+# the focus-segment store via dash_clientside.set_props (no round trip needed
+# just to detect the gesture). A second double-click on the already-focused
+# marker clears it.
+app.clientside_callback(
+    """
+    function(_n) {
+        // The id lands on dcc.Graph's wrapper div; the element with the
+        // plotly event emitter (.on) is its child ".js-plotly-plot".
+        var wrapper = document.getElementById('risk-map-graph');
+        var gd = wrapper && wrapper.querySelector('.js-plotly-plot');
+        if (gd && !gd._frostsightDblClickBound) {
+            gd._frostsightDblClickBound = true;
+            gd._frostsightLastClick = {id: null, t: 0};
+            gd._frostsightFocused = null;
+            gd.on('plotly_click', function(evt) {
+                var pt = evt.points && evt.points[0];
+                if (!pt || pt.customdata === undefined) { return; }
+                var id = pt.customdata;
+                var now = Date.now();
+                var last = gd._frostsightLastClick;
+                gd._frostsightLastClick = {id: id, t: now};
+                if (last.id === id && (now - last.t) < 500) {
+                    gd._frostsightLastClick = {id: null, t: 0};
+                    var next = (gd._frostsightFocused === id) ? null : id;
+                    gd._frostsightFocused = next;
+                    window.dash_clientside.set_props('focus-segment', {data: next});
+                }
+            });
+        }
+        return window.dash_clientside.no_update;
+    }
+    """,
+    Output("attach-dblclick-listener", "n_intervals"),
+    Input("attach-dblclick-listener", "n_intervals"),
+)
+
+
 @app.callback(
-    Output("risk-map-graph", "figure", allow_duplicate=True),
-    Input("map-reload-interval", "n_intervals"),
+    Output("focus-segment", "data", allow_duplicate=True),
     Input("map-refresh-button", "n_clicks"),
+    Input("map-reload-interval", "n_intervals"),
     prevent_initial_call=True,
 )
-def on_map_reload(_n_intervals, _n_clicks):
-    """Re-fetch/re-score road data and rebuild the map — the road-map analogue
-    of wsd-dashboard's on_page_load_interval / on_overview_map_refresh_button_click."""
-    global route_df, road_links
-    route_df = load_route_df()
-    road_links = load_road_links()
-    return build_map_figure(route_df, 0, road_links)
+def on_map_refresh_clears_focus(_n_clicks, _n_intervals):
+    """Refreshing or reloading the map data drops any click-focus."""
+    return None
 
 
+# A single callback owning risk-map-graph.figure: reload, refresh, the 2s
+# vehicle tick, and a click-focus change all funnel through here. Two
+# separate callbacks racing to write the same Output (the vehicle-interval
+# tick landing right after a click-focus rebuild, or vice versa) was
+# overwriting the focused/zoomed view almost immediately after a double-click
+# set it — a single callback with one clear per-trigger branch removes that
+# race instead of relying on timing between two independent callbacks.
+#
+# Branch on focus_id's *value*, not on dash.callback_context.triggered_id:
+# when a focus-segment change lands in the same batch as a vehicle-interval
+# tick (which happens often, since the tick fires every 2s regardless of
+# clicks), Dash reports only one winning triggered_id for the whole batch —
+# branching on which id "won" silently dropped the focus rebuild whenever it
+# lost that coin flip to the tick.
 @app.callback(
     Output("risk-map-graph", "figure"),
+    Input("map-reload-interval", "n_intervals"),
+    Input("map-refresh-button", "n_clicks"),
+    Input("focus-segment", "data"),
     Input("vehicle-interval", "n_intervals"),
+    prevent_initial_call=True,
 )
-def update_vehicle_position(n_intervals: int):
-    return build_map_figure(route_df, n_intervals % len(route_df), road_links)
+def on_map_update(_n_reload, _n_refresh, focus_id, n_vehicle_intervals):
+    triggered_ids = {t["prop_id"].split(".")[0] for t in dash.callback_context.triggered}
+    global route_df, road_links
+    if triggered_ids & {"map-reload-interval", "map-refresh-button"}:
+        route_df = load_route_df()
+        road_links = load_road_links()
+    if focus_id is not None:
+        return build_map_figure(route_df, 0, road_links, focus_id=focus_id)
+    if "vehicle-interval" in triggered_ids:
+        return build_map_figure(route_df, n_vehicle_intervals % len(route_df), road_links)
+    return build_map_figure(route_df, 0, road_links)
 
 
 def road_detail_tab():

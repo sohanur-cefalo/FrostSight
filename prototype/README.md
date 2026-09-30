@@ -38,6 +38,7 @@ doesn't matter, since `train` never reads or overwrites the serving files once t
 |---|---|
 | `generate_data.py` | Synthetic Troms-county road segments + 10-min weather series, with a documented heuristic label |
 | `build_dataset.py` | Phase 1 real-data path: real NVDB road-weather station geometry via `collector/nvdb.py` + `collector/elevation.py`, still-synthetic weather sited on those real coordinates |
+| `clean_road_names.py` | One-off fixup for a `segments.csv` written before `build_dataset.py` stopped combining route + place into one string (`"F7940 · Arnøya"` -> `"Arnøya"`); a fresh `build_dataset.py` run doesn't need this |
 | `build_road_network.py` | Phase 1b real-data path: real road-link geometry near those stations via `collector/nvdb.py`, written to `road_links.json`; the map colors each real link by its nearest station's risk level instead of only drawing station points |
 | `build_live_weather.py` | Phase 2 real-data path: real live air temp/wind/precip per real station via `collector/met.py`; surface temp is still an approximation from air temp until Phase 3 (DATEX) |
 | `features.py` | Shared `surface_temp_trend_1h` calc, time-aware so it works whether observations are 10-min synthetic or hourly real forecast points |
